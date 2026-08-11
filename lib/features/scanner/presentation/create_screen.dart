@@ -3,14 +3,17 @@ import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
-import '../../../core/models/wearable.dart';
-import '../../../core/storage/wearable_repository.dart';
 import '../../../core/theme/app_theme.dart';
-import '../../../core/widgets/crystal_art.dart';
+import '../../crystallizer/domain/entities/wearable.dart';
+import '../../crystallizer/presentation/widgets/crystal_art.dart';
+import '../../gallery/data/wearable_repository.dart';
 import '../../item/presentation/item_detail_screen.dart';
 import '../data/capture_service.dart';
+import '../domain/entities/capture_result.dart';
+import '../domain/entities/capture_stage.dart';
 
-enum CaptureStage { ready, recording, choose, crystallizing }
+part 'painters/scanner_painters.dart';
+part 'widgets/generation_views.dart';
 
 class CreateScreen extends StatefulWidget {
   const CreateScreen({super.key});
@@ -29,6 +32,7 @@ class _CreateScreenState extends State<CreateScreen>
   CameraController? _camera;
   CaptureResult? _captureResult;
   String? _cameraError;
+  bool _isCapturing = false;
 
   static const Wearable _draft = Wearable(
     id: 'NEW',
@@ -42,6 +46,10 @@ class _CreateScreenState extends State<CreateScreen>
     isOwned: true,
   );
 
+  List<Color> get _currentPalette => _captureResult?.palette ?? _draft.palette;
+
+  int get _currentSeed => _captureResult?.seed ?? _draft.seed;
+
   @override
   void initState() {
     super.initState();
@@ -52,6 +60,10 @@ class _CreateScreenState extends State<CreateScreen>
     unawaited(_initializeCamera());
   }
 
+  /*
+   * Инициализирует только заднюю камеру и только пока открыта вкладка создания.
+   * Среднее разрешение снижает расход памяти на складных и бюджетных устройствах.
+   */
   Future<void> _initializeCamera() async {
     try {
       final List<CameraDescription> cameras = await availableCameras();
@@ -63,7 +75,7 @@ class _CreateScreenState extends State<CreateScreen>
       );
       final CameraController controller = CameraController(
         selected,
-        ResolutionPreset.high,
+        ResolutionPreset.medium,
         enableAudio: false,
       );
       await controller.initialize();
@@ -85,12 +97,20 @@ class _CreateScreenState extends State<CreateScreen>
     super.dispose();
   }
 
+  /*
+   * Блокирует повторные нажатия до окончания фото и трёхсекундной записи.
+   * Ошибка возвращает пользователя в готовое состояние без потери интерфейса.
+   */
   Future<void> _capture() async {
+    if (_isCapturing) return;
     final CameraController? camera = _camera;
-    if (camera == null || !camera.value.isInitialized) {
+    if (camera == null ||
+        !camera.value.isInitialized ||
+        camera.value.isTakingPicture) {
       setState(() => _cameraError = 'Камера ещё не готова');
       return;
     }
+    _isCapturing = true;
     setState(() => _stage = CaptureStage.recording);
     try {
       final CaptureResult result = await _captureService.capture(camera);
@@ -107,41 +127,55 @@ class _CreateScreenState extends State<CreateScreen>
           _cameraError = 'Не удалось выполнить захват: $error';
         });
       }
+    } finally {
+      _isCapturing = false;
     }
   }
 
-  void _generate() {
+  /*
+   * Создаёт локальный объект после анимации и только затем открывает карточку.
+   * Репозиторий сохраняет результат до перехода, поэтому черновик не потеряется.
+   */
+  Future<void> _generate() async {
     setState(() => _stage = CaptureStage.crystallizing);
-    _controller.forward(from: 0).whenComplete(() {
+    try {
+      await _controller.forward(from: 0);
       if (!mounted) return;
-      final CaptureResult? capture = _captureResult;
-      final Wearable result = Wearable(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
-        name: 'RAW ECHO',
-        kind: _kind,
-        palette: capture?.palette ?? _draft.palette,
-        seed: capture?.seed ?? _draft.seed,
-        price: 0,
-        creator: 'YOU',
-        likes: 0,
-        isOwned: true,
-        imagePath: capture?.imagePath,
-        audioPath: capture?.audioPath,
-        createdAt: DateTime.now(),
+      final Wearable result = _createWearableFromCapture();
+      await _repository.save(result);
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ItemDetailScreen(wearable: result, isNew: true),
+        ),
       );
-      _repository.save(result).then((_) {
-        if (!mounted) return;
-        Navigator.of(context)
-            .push(
-              MaterialPageRoute<void>(
-                builder: (_) => ItemDetailScreen(wearable: result, isNew: true),
-              ),
-            )
-            .then((_) {
-              if (mounted) setState(() => _stage = CaptureStage.ready);
-            });
+      if (mounted) setState(() => _stage = CaptureStage.ready);
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _stage = CaptureStage.ready;
+        _cameraError = 'Не удалось сохранить предмет: $error';
       });
-    });
+    }
+  }
+
+  /* Собирает доменную модель отдельно от навигации и анимации экрана. */
+  Wearable _createWearableFromCapture() {
+    final CaptureResult? capture = _captureResult;
+    return Wearable(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      name: 'RAW ECHO',
+      kind: _kind,
+      palette: _currentPalette,
+      seed: _currentSeed,
+      price: 0,
+      creator: 'YOU',
+      likes: 0,
+      isOwned: true,
+      imagePath: capture?.imagePath,
+      audioPath: capture?.audioPath,
+      createdAt: DateTime.now(),
+    );
   }
 
   @override
@@ -159,8 +193,8 @@ class _CreateScreenState extends State<CreateScreen>
           ),
           CaptureStage.choose => _ChooseView(
             selected: _kind,
-            palette: _captureResult?.palette ?? _draft.palette,
-            seed: _captureResult?.seed ?? _draft.seed,
+            palette: _currentPalette,
+            seed: _currentSeed,
             onSelected: (WearableKind value) => setState(() => _kind = value),
             onGenerate: _generate,
           ),
@@ -170,8 +204,8 @@ class _CreateScreenState extends State<CreateScreen>
               id: _draft.id,
               name: _draft.name,
               kind: _kind,
-              palette: _captureResult?.palette ?? _draft.palette,
-              seed: _captureResult?.seed ?? _draft.seed,
+              palette: _currentPalette,
+              seed: _currentSeed,
               price: 0,
               creator: 'YOU',
               likes: 0,
@@ -350,82 +384,6 @@ class _CameraTexture extends StatelessWidget {
   }
 }
 
-class _OrganicTexturePainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final Paint paint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3;
-    for (int i = 0; i < 14; i++) {
-      paint.color = (i.isEven ? AppColors.acid : AppColors.orange).withValues(
-        alpha: .05 + (i % 4) * .018,
-      );
-      final Path p = Path()..moveTo(-20, size.height * (i / 14));
-      for (double x = 0; x <= size.width + 40; x += 34) {
-        p.quadraticBezierTo(
-          x + 17,
-          size.height * (i / 14) + (i.isEven ? 22 : -20),
-          x + 34,
-          size.height * (i / 14),
-        );
-      }
-      canvas.drawPath(p, paint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
-class _ScannerOverlayPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final Paint line = Paint()
-      ..color = Colors.white.withValues(alpha: .16)
-      ..strokeWidth = .8;
-    for (int i = 1; i < 4; i++) {
-      canvas.drawLine(
-        Offset(size.width * i / 4, 110),
-        Offset(size.width * i / 4, size.height - 230),
-        line,
-      );
-      canvas.drawLine(
-        Offset(20, 110 + (size.height - 340) * i / 4),
-        Offset(size.width - 20, 110 + (size.height - 340) * i / 4),
-        line,
-      );
-    }
-    final Paint corners = Paint()
-      ..color = AppColors.acid
-      ..strokeWidth = 2.5
-      ..style = PaintingStyle.stroke;
-    final Rect rect = Rect.fromLTRB(
-      20,
-      110,
-      size.width - 20,
-      size.height - 230,
-    );
-    const double l = 28;
-    canvas.drawPath(
-      Path()
-        ..moveTo(rect.left, rect.top + l)
-        ..lineTo(rect.left, rect.top)
-        ..lineTo(rect.left + l, rect.top),
-      corners,
-    );
-    canvas.drawPath(
-      Path()
-        ..moveTo(rect.right - l, rect.bottom)
-        ..lineTo(rect.right, rect.bottom)
-        ..lineTo(rect.right, rect.bottom - l),
-      corners,
-    );
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
 class _RoundIcon extends StatelessWidget {
   const _RoundIcon({required this.icon});
   final IconData icon;
@@ -457,196 +415,6 @@ class _SoundMeter extends StatelessWidget {
           color: i < 13 ? AppColors.orange : Colors.white38,
           borderRadius: BorderRadius.circular(3),
         ),
-      ),
-    ),
-  );
-}
-
-class _ChooseView extends StatelessWidget {
-  const _ChooseView({
-    required this.selected,
-    required this.palette,
-    required this.seed,
-    required this.onSelected,
-    required this.onGenerate,
-  });
-  final WearableKind selected;
-  final List<Color> palette;
-  final int seed;
-  final ValueChanged<WearableKind> onSelected;
-  final VoidCallback onGenerate;
-
-  @override
-  Widget build(BuildContext context) {
-    const List<(WearableKind, String)> options = <(WearableKind, String)>[
-      (WearableKind.tshirt, 'ФУТБОЛКА'),
-      (WearableKind.hoodie, 'ХУДИ'),
-      (WearableKind.dress, 'ПЛАТЬЕ'),
-      (WearableKind.sneakers, 'КЕДЫ'),
-    ];
-    return Padding(
-      key: const ValueKey<String>('choose'),
-      padding: const EdgeInsets.fromLTRB(20, 22, 20, 96),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Text(
-            '02 / ФОРМА',
-            style: Theme.of(context).textTheme.labelLarge?.copyWith(
-              color: AppColors.acid,
-              letterSpacing: 2,
-            ),
-          ),
-          const SizedBox(height: 10),
-          Text(
-            'ВЫБЕРИ\nСИЛУЭТ',
-            style: Theme.of(context).textTheme.displayLarge,
-          ),
-          const SizedBox(height: 12),
-          const Text(
-            'Текстура и звуковой рельеф уже готовы. Теперь выбери, во что превратится этот отпечаток.',
-          ),
-          const SizedBox(height: 22),
-          Expanded(
-            child: GridView.builder(
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 2,
-                mainAxisSpacing: 12,
-                crossAxisSpacing: 12,
-              ),
-              itemCount: options.length,
-              itemBuilder: (BuildContext context, int index) {
-                final (WearableKind kind, String label) = options[index];
-                final bool active = kind == selected;
-                final Wearable preview = Wearable(
-                  id: '',
-                  name: label,
-                  kind: kind,
-                  palette: palette,
-                  seed: seed,
-                  price: 0,
-                  creator: '',
-                  likes: 0,
-                );
-                return GestureDetector(
-                  onTap: () => onSelected(kind),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 220),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(
-                        color: active ? AppColors.acid : AppColors.line,
-                        width: active ? 2 : 1,
-                      ),
-                    ),
-                    clipBehavior: Clip.antiAlias,
-                    child: Stack(
-                      children: <Widget>[
-                        Positioned.fill(child: CrystalArt(wearable: preview)),
-                        Positioned(
-                          top: 11,
-                          right: 11,
-                          child: Icon(
-                            active
-                                ? Icons.check_circle_rounded
-                                : Icons.circle_outlined,
-                            color: active ? AppColors.acid : Colors.white54,
-                          ),
-                        ),
-                        Positioned(
-                          left: 12,
-                          bottom: 11,
-                          child: Text(
-                            label,
-                            style: Theme.of(context).textTheme.labelLarge,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-          const SizedBox(height: 14),
-          EchoButton(
-            label: 'ЗАПУСТИТЬ КРИСТАЛЛИЗАЦИЮ',
-            icon: Icons.auto_awesome_rounded,
-            onPressed: onGenerate,
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _CrystalizingView extends StatelessWidget {
-  const _CrystalizingView({required this.controller, required this.wearable});
-  final AnimationController controller;
-  final Wearable wearable;
-
-  String _status(double value) {
-    if (value < .25) return 'ПРОЯВЛЯЕМ СЕМЕНА';
-    if (value < .67) return 'РАСТИМ ПОЛИГОНЫ';
-    if (value < .88) return 'НАКЛАДЫВАЕМ ЗВУК';
-    return 'ЗАКАЛЯЕМ ФОРМУ';
-  }
-
-  @override
-  Widget build(BuildContext context) => AnimatedBuilder(
-    key: const ValueKey<String>('crystal'),
-    animation: controller,
-    builder: (BuildContext context, Widget? child) => Padding(
-      padding: const EdgeInsets.fromLTRB(20, 24, 20, 100),
-      child: Column(
-        children: <Widget>[
-          Row(
-            children: <Widget>[
-              Text(
-                '03 / ГЕНЕРАЦИЯ',
-                style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                  color: AppColors.acid,
-                  letterSpacing: 2,
-                ),
-              ),
-              const Spacer(),
-              Text('${(controller.value * 100).round()}%'),
-            ],
-          ),
-          const SizedBox(height: 34),
-          Expanded(
-            child: Opacity(
-              opacity: .2 + controller.value * .8,
-              child: Transform.scale(
-                scale: .72 + controller.value * .28,
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(30),
-                  child: CrystalArt(wearable: wearable, showGrid: true),
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 26),
-          Text(
-            _status(controller.value),
-            style: Theme.of(context).textTheme.headlineMedium,
-          ),
-          const SizedBox(height: 14),
-          LinearProgressIndicator(
-            value: controller.value,
-            minHeight: 3,
-            color: AppColors.acid,
-            backgroundColor: AppColors.line,
-            borderRadius: BorderRadius.circular(4),
-          ),
-          const SizedBox(height: 10),
-          Text(
-            'ТВОЙ ЗВУК ФОРМИРУЕТ РЕЛЬЕФ',
-            style: Theme.of(
-              context,
-            ).textTheme.labelLarge?.copyWith(color: AppColors.muted),
-          ),
-        ],
       ),
     ),
   );

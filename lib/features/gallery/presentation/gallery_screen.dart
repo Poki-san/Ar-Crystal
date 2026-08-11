@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/models/wearable.dart';
-import '../../../core/storage/wearable_repository.dart';
 import '../../../core/theme/app_theme.dart';
-import '../../../core/widgets/crystal_art.dart';
+import '../../crystallizer/domain/entities/wearable.dart';
+import '../../crystallizer/presentation/widgets/crystal_art.dart';
 import '../../item/presentation/item_detail_screen.dart';
+import '../data/wearable_repository.dart';
 
 class GalleryScreen extends StatelessWidget {
   const GalleryScreen({super.key});
@@ -13,6 +13,7 @@ class GalleryScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    /* revision перестраивает экран сразу после локального сохранения предмета. */
     return AnimatedBuilder(
       animation: WearableRepository.revision,
       builder: (BuildContext context, Widget? child) =>

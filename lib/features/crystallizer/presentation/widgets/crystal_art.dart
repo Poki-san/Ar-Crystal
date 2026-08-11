@@ -1,9 +1,8 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 
-import '../models/wearable.dart';
-import '../theme/app_theme.dart';
+import '../rendering/crystal_pattern_renderer.dart';
+import '../../../../core/theme/app_theme.dart';
+import '../../domain/entities/wearable.dart';
 
 class CrystalArt extends StatelessWidget {
   const CrystalArt({
@@ -34,6 +33,7 @@ class CrystalPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    /* Seed делает расположение граней стабильным для конкретного предмета. */
     final Rect bounds = Offset.zero & size;
     canvas.drawRect(
       bounds,
@@ -47,57 +47,10 @@ class CrystalPainter extends CustomPainter {
     if (showGrid) _paintGrid(canvas, size);
 
     final Path garment = _garmentPath(size, wearable.kind);
-    canvas.save();
-    canvas.clipPath(garment);
-    final math.Random random = math.Random(wearable.seed);
-    final double cell = size.shortestSide / 5.2;
-    for (double y = -cell; y < size.height + cell; y += cell * .78) {
-      for (double x = -cell; x < size.width + cell; x += cell * .86) {
-        final double jitterX = (random.nextDouble() - .5) * cell * .55;
-        final double jitterY = (random.nextDouble() - .5) * cell * .55;
-        final Offset c = Offset(x + jitterX, y + jitterY);
-        final int sides = 4 + random.nextInt(3);
-        final Path shard = Path();
-        for (int i = 0; i < sides; i++) {
-          final double angle =
-              (math.pi * 2 * i / sides) + random.nextDouble() * .35;
-          final double radius = cell * (.55 + random.nextDouble() * .45);
-          final Offset p =
-              c + Offset(math.cos(angle) * radius, math.sin(angle) * radius);
-          i == 0 ? shard.moveTo(p.dx, p.dy) : shard.lineTo(p.dx, p.dy);
-        }
-        shard.close();
-        final Color color =
-            wearable.palette[random.nextInt(wearable.palette.length)];
-        canvas.drawPath(
-          shard,
-          Paint()
-            ..color = color.withValues(alpha: .72 + random.nextDouble() * .28),
-        );
-        canvas.drawPath(
-          shard,
-          Paint()
-            ..color = Colors.white.withValues(alpha: .15)
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = 1,
-        );
-      }
-    }
-    canvas.drawRect(
-      bounds,
-      Paint()
-        ..shader = RadialGradient(
-          center: const Alignment(-.25, -.4),
-          radius: 1.1,
-          colors: <Color>[
-            Colors.white.withValues(alpha: .25),
-            Colors.transparent,
-            Colors.black.withValues(alpha: .48),
-          ],
-        ).createShader(bounds)
-        ..blendMode = BlendMode.softLight,
-    );
-    canvas.restore();
+    CrystalPatternRenderer(
+      palette: wearable.palette,
+      seed: wearable.seed,
+    ).paint(canvas: canvas, clipPath: garment, bounds: bounds);
     canvas.drawPath(
       garment,
       Paint()
@@ -119,6 +72,7 @@ class CrystalPainter extends CustomPainter {
     }
   }
 
+  /* Возвращает нормализованный 2D-силуэт выбранного кроя для карточек. */
   Path _garmentPath(Size size, WearableKind kind) {
     final double w = size.width;
     final double h = size.height;

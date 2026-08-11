@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/models/wearable.dart';
 import '../../../core/theme/app_theme.dart';
-import '../../../core/widgets/crystal_art.dart';
 import '../../ar_preview/presentation/ar_try_on_screen.dart';
+import '../../crystallizer/domain/entities/wearable.dart';
+import '../../crystallizer/presentation/widgets/crystal_art.dart';
 
 class ItemDetailScreen extends StatefulWidget {
   const ItemDetailScreen({
@@ -22,6 +22,7 @@ class ItemDetailScreen extends StatefulWidget {
 class _ItemDetailScreenState extends State<ItemDetailScreen> {
   bool _liked = false;
 
+  /* Передаёт в AR тот же предмет и seed, чтобы принт совпадал с карточкой. */
   void _openTryOn() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
@@ -30,6 +31,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
     );
   }
 
+  /* Показывает локальное пояснение вместо недоступной офлайн-транзакции. */
   void _showMintInfo() {
     showModalBottomSheet<void>(
       context: context,
@@ -151,7 +153,7 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: <Widget>[
                           Text(
-                            '#${item.id}  /  ${_kindName(item.kind)}',
+                            '#${item.id}  /  ${item.kind.label}',
                             style: Theme.of(context).textTheme.labelLarge
                                 ?.copyWith(
                                   color: AppColors.acid,
@@ -297,13 +299,6 @@ class _ItemDetailScreenState extends State<ItemDetailScreen> {
       ),
     );
   }
-
-  String _kindName(WearableKind kind) => switch (kind) {
-    WearableKind.tshirt => 'ФУТБОЛКА',
-    WearableKind.hoodie => 'ХУДИ',
-    WearableKind.dress => 'ПЛАТЬЕ',
-    WearableKind.sneakers => 'КЕДЫ',
-  };
 }
 
 class _CircleAction extends StatelessWidget {

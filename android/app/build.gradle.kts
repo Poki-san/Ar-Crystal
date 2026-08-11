@@ -1,6 +1,6 @@
 plugins {
     id("com.android.application")
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+    // Flutter Gradle Plugin подключается после Android и Kotlin плагинов.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
@@ -24,8 +24,15 @@ android {
 
     buildTypes {
         release {
-            /* Release signing must be replaced before store publication. */
+            /* Перед публикацией нужно заменить debug-подпись на production key. */
             signingConfig = signingConfigs.getByName("debug")
+            /*
+             * CameraX запускает WorkManager раньше Flutter. Отключение shrink
+             * не позволяет R8 удалить сгенерированный Room класс WorkDatabase,
+             * без которого приложение падает при запуске на Android 12.
+             */
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }

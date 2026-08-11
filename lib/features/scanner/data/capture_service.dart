@@ -8,23 +8,17 @@ import 'package:image/image.dart' as image_lib;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 
-class CaptureResult {
-  const CaptureResult({
-    required this.imagePath,
-    required this.audioPath,
-    required this.palette,
-    required this.seed,
-  });
-
-  final String imagePath;
-  final String audioPath;
-  final List<Color> palette;
-  final int seed;
-}
+import '../domain/entities/capture_result.dart';
 
 class CaptureService {
+  static const Duration _audioDuration = Duration(seconds: 3);
+  static const int _audioSampleRate = 44100;
   final AudioRecorder _recorder = AudioRecorder();
 
+  /*
+   * Выполняет атомарный офлайн-захват: фотографирует текстуру, записывает звук,
+   * извлекает визуальный отпечаток и возвращает только локальные пути к файлам.
+   */
   Future<CaptureResult> capture(CameraController camera) async {
     if (!await _recorder.hasPermission()) {
       throw CameraException(
@@ -38,33 +32,42 @@ class CaptureService {
     final int stamp = DateTime.now().millisecondsSinceEpoch;
     final String audioPath = '${captures.path}/echo_$stamp.wav';
 
-    await _recorder.start(
-      const RecordConfig(
-        encoder: AudioEncoder.wav,
-        sampleRate: 44100,
-        bitRate: 128000,
-      ),
-      path: audioPath,
-    );
-    final XFile shot = await camera.takePicture();
-    final String imagePath = '${captures.path}/texture_$stamp.jpg';
-    await File(shot.path).copy(imagePath);
-    await Future<void>.delayed(const Duration(seconds: 3));
-    final String? recordedPath = await _recorder.stop();
-    final Uint8List bytes = await File(imagePath).readAsBytes();
-    final _ImageFingerprint fingerprint = await compute(_analyzeImage, bytes);
-    final Uint8List audioBytes = await File(
-      recordedPath ?? audioPath,
-    ).readAsBytes();
-    final int audioEnergy = await compute(_analyzeAudioEnergy, audioBytes);
-    return CaptureResult(
-      imagePath: imagePath,
-      audioPath: recordedPath ?? audioPath,
-      palette: fingerprint.colors.map(Color.new).toList(),
-      seed: math.max(1, (fingerprint.seed + audioEnergy) % 997),
-    );
+    bool recording = false;
+    try {
+      await _recorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.wav,
+          sampleRate: _audioSampleRate,
+          bitRate: 128000,
+        ),
+        path: audioPath,
+      );
+      recording = true;
+      final XFile shot = await camera.takePicture();
+      final String imagePath = '${captures.path}/texture_$stamp.jpg';
+      await File(shot.path).copy(imagePath);
+      await Future<void>.delayed(_audioDuration);
+      final String? recordedPath = await _recorder.stop();
+      recording = false;
+      final Uint8List bytes = await File(imagePath).readAsBytes();
+      final _ImageFingerprint fingerprint = await compute(_analyzeImage, bytes);
+      final Uint8List audioBytes = await File(
+        recordedPath ?? audioPath,
+      ).readAsBytes();
+      final int audioEnergy = await compute(_analyzeAudioEnergy, audioBytes);
+      return CaptureResult(
+        imagePath: imagePath,
+        audioPath: recordedPath ?? audioPath,
+        palette: fingerprint.colors.map(Color.new).toList(),
+        seed: math.max(1, (fingerprint.seed + audioEnergy) % 997),
+      );
+    } on Object {
+      if (recording) await _recorder.cancel();
+      rethrow;
+    }
   }
 
+  /* Освобождает нативный аудиорекордер вместе с экраном создания. */
   void dispose() => _recorder.dispose();
 }
 
@@ -74,6 +77,10 @@ class _ImageFingerprint {
   final int seed;
 }
 
+/*
+ * Уменьшает снимок перед анализом: так Sobel и палитра выполняются быстро даже
+ * на бюджетном устройстве и не удерживают полный кадр в isolate.
+ */
 _ImageFingerprint _analyzeImage(Uint8List bytes) {
   final image_lib.Image? decoded = image_lib.decodeImage(bytes);
   if (decoded == null) {
@@ -100,9 +107,7 @@ _ImageFingerprint _analyzeImage(Uint8List bytes) {
     for (int x = 1; x < sample.width - 1; x += 2) {
       int luminance(int px, int py) {
         final image_lib.Pixel p = sample.getPixel(px, py);
-        return (p.r.toInt() * 299 +
-                p.g.toInt() * 587 +
-                p.b.toInt() * 114) ~/
+        return (p.r.toInt() * 299 + p.g.toInt() * 587 + p.b.toInt() * 114) ~/
             1000;
       }
 
@@ -135,6 +140,7 @@ _ImageFingerprint _analyzeImage(Uint8List bytes) {
   return _ImageFingerprint(colors, math.max(1, edgeEnergy % 997));
 }
 
+/* Извлекает усреднённую энергию PCM-сигнала без передачи аудио на сервер. */
 int _analyzeAudioEnergy(Uint8List bytes) {
   if (bytes.length <= 44) return 0;
   int energy = 0;

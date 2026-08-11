@@ -5,8 +5,12 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 
-import '../../../core/models/wearable.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../crystallizer/domain/entities/wearable.dart';
+import '../../crystallizer/presentation/rendering/crystal_pattern_renderer.dart';
+import 'utils/pose_coordinate_mapper.dart';
+
+part 'widgets/ar_controls.dart';
 
 class ArTryOnScreen extends StatefulWidget {
   const ArTryOnScreen({required this.wearable, super.key});
@@ -18,6 +22,10 @@ class ArTryOnScreen extends StatefulWidget {
 }
 
 class _ArTryOnScreenState extends State<ArTryOnScreen> {
+  /*
+   * Потоковая модель быстрее accurate-варианта и предназначена для камеры.
+   * Детектор живёт столько же, сколько экран, чтобы не загружать модель заново.
+   */
   final PoseDetector _detector = PoseDetector(
     options: PoseDetectorOptions(
       model: PoseDetectionModel.base,
@@ -29,16 +37,21 @@ class _ArTryOnScreenState extends State<ArTryOnScreen> {
   Size? _imageSize;
   InputImageRotation _rotation = InputImageRotation.rotation0deg;
   bool _processing = false;
+  bool _cameraOperationInProgress = false;
   bool _echoMode = true;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    _initialize();
+    _initializeCamera();
   }
 
-  Future<void> _initialize() async {
+  /*
+   * Открывает фронтальную камеру в формате, который ML Kit принимает без
+   * дорогостоящей конвертации каждого кадра в Dart.
+   */
+  Future<void> _initializeCamera() async {
     try {
       final List<CameraDescription> cameras = await availableCameras();
       if (cameras.isEmpty) throw StateError('Камера не найдена');
@@ -57,7 +70,7 @@ class _ArTryOnScreenState extends State<ArTryOnScreen> {
       );
       await controller.initialize();
       await controller.startImageStream(
-        (CameraImage image) => _processFrame(image, selected),
+        (CameraImage image) => _detectPose(image, selected),
       );
       if (!mounted) {
         await controller.dispose();
@@ -69,7 +82,11 @@ class _ArTryOnScreenState extends State<ArTryOnScreen> {
     }
   }
 
-  Future<void> _processFrame(
+  /*
+   * Передаёт в ML Kit не более одного кадра одновременно. Это ограничение
+   * защищает очередь platform channel от накопления кадров и роста памяти.
+   */
+  Future<void> _detectPose(
     CameraImage image,
     CameraDescription description,
   ) async {
@@ -110,6 +127,7 @@ class _ArTryOnScreenState extends State<ArTryOnScreen> {
 
   @override
   void dispose() {
+    /* Нативные ресурсы камеры и ML-модели нельзя оставлять между экранами. */
     _camera?.dispose();
     _detector.close();
     super.dispose();
@@ -135,6 +153,11 @@ class _ArTryOnScreenState extends State<ArTryOnScreen> {
                   pose: _pose!,
                   imageSize: _imageSize!,
                   rotation: _rotation,
+                  lensDirection:
+                      controller?.description.lensDirection ??
+                      CameraLensDirection.front,
+                  kind: widget.wearable.kind,
+                  seed: widget.wearable.seed,
                   palette: widget.wearable.palette,
                   echoMode: _echoMode,
                 ),
@@ -238,94 +261,77 @@ class _ArTryOnScreenState extends State<ArTryOnScreen> {
     );
   }
 
+  /*
+   * Камера не умеет фотографировать во время image stream, поэтому поток позы
+   * временно останавливается и обязательно запускается снова после снимка.
+   */
   Future<void> _capturePhoto() async {
+    if (_cameraOperationInProgress) return;
     final CameraController? controller = _camera;
     if (controller == null || !controller.value.isInitialized) return;
+    _cameraOperationInProgress = true;
     try {
-      await controller.stopImageStream();
+      if (controller.value.isStreamingImages) {
+        await controller.stopImageStream();
+      }
       final XFile file = await controller.takePicture();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Кадр сохранён локально: ${file.name}')),
         );
       }
-      await controller.startImageStream(
-        (CameraImage image) => _processFrame(image, controller.description),
-      );
+      if (mounted && controller.value.isInitialized) {
+        await controller.startImageStream(
+          (CameraImage image) => _detectPose(image, controller.description),
+        );
+      }
     } on Object catch (error) {
       if (mounted) setState(() => _error = '$error');
+    } finally {
+      _cameraOperationInProgress = false;
     }
   }
 
+  /*
+   * Переключает камеру последовательно: сначала освобождает старый поток,
+   * затем создаёт новый контроллер. Параллельное открытие ломает Camera2.
+   */
   Future<void> _switchCamera() async {
-    final List<CameraDescription> cameras = await availableCameras();
-    if (cameras.length < 2) return;
-    final CameraLensDirection current =
-        _camera?.description.lensDirection ?? CameraLensDirection.front;
-    final CameraDescription next = cameras.firstWhere(
-      (CameraDescription camera) => camera.lensDirection != current,
-    );
-    await _camera?.dispose();
-    final CameraController controller = CameraController(
-      next,
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21
-          : ImageFormatGroup.bgra8888,
-    );
-    await controller.initialize();
-    await controller.startImageStream(
-      (CameraImage image) => _processFrame(image, next),
-    );
-    if (mounted) setState(() => _camera = controller);
+    if (_cameraOperationInProgress) return;
+    _cameraOperationInProgress = true;
+    try {
+      final List<CameraDescription> cameras = await availableCameras();
+      if (cameras.length < 2) return;
+      final CameraLensDirection current =
+          _camera?.description.lensDirection ?? CameraLensDirection.front;
+      final CameraDescription next = cameras.firstWhere(
+        (CameraDescription camera) => camera.lensDirection != current,
+      );
+      final CameraController? currentController = _camera;
+      if (mounted) setState(() => _camera = null);
+      if (currentController?.value.isStreamingImages ?? false) {
+        await currentController?.stopImageStream();
+      }
+      await currentController?.dispose();
+      final CameraController controller = CameraController(
+        next,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: Platform.isAndroid
+            ? ImageFormatGroup.nv21
+            : ImageFormatGroup.bgra8888,
+      );
+      await controller.initialize();
+      await controller.startImageStream(
+        (CameraImage image) => _detectPose(image, next),
+      );
+      if (mounted) setState(() => _camera = controller);
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    } finally {
+      _cameraOperationInProgress = false;
+    }
   }
-}
-
-class _FullScreenCamera extends StatelessWidget {
-  const _FullScreenCamera({required this.controller});
-  final CameraController controller;
-
-  @override
-  Widget build(BuildContext context) => SizedBox.expand(
-    child: FittedBox(
-      fit: BoxFit.cover,
-      child: SizedBox(
-        width: controller.value.previewSize?.height ?? 1,
-        height: controller.value.previewSize?.width ?? 1,
-        child: CameraPreview(controller),
-      ),
-    ),
-  );
-}
-
-class _StatusChip extends StatelessWidget {
-  const _StatusChip({required this.bodyFound});
-  final bool bodyFound;
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-    decoration: BoxDecoration(
-      color: AppColors.background.withValues(alpha: .65),
-      borderRadius: BorderRadius.circular(30),
-      border: Border.all(color: Colors.white24),
-    ),
-    child: Row(
-      children: <Widget>[
-        Icon(
-          Icons.circle,
-          size: 8,
-          color: bodyFound ? AppColors.acid : AppColors.orange,
-        ),
-        const SizedBox(width: 7),
-        Text(
-          bodyFound ? 'ТЕЛО НАЙДЕНО' : 'ИЩЕМ ТЕЛО',
-          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
-        ),
-      ],
-    ),
-  );
 }
 
 class _PoseGarmentPainter extends CustomPainter {
@@ -333,6 +339,9 @@ class _PoseGarmentPainter extends CustomPainter {
     required this.pose,
     required this.imageSize,
     required this.rotation,
+    required this.lensDirection,
+    required this.kind,
+    required this.seed,
     required this.palette,
     required this.echoMode,
   });
@@ -340,84 +349,186 @@ class _PoseGarmentPainter extends CustomPainter {
   final Pose pose;
   final Size imageSize;
   final InputImageRotation rotation;
+  final CameraLensDirection lensDirection;
+  final WearableKind kind;
+  final int seed;
   final List<Color> palette;
   final bool echoMode;
 
+  static const double _minimumLandmarkConfidence = .45;
+  static const double _minimumShoulderWidth = 28;
+
   @override
   void paint(Canvas canvas, Size size) {
+    if (kind == WearableKind.sneakers) {
+      _paintSneakers(canvas, size);
+      return;
+    }
     final PoseLandmark? leftShoulder =
         pose.landmarks[PoseLandmarkType.leftShoulder];
     final PoseLandmark? rightShoulder =
         pose.landmarks[PoseLandmarkType.rightShoulder];
     final PoseLandmark? leftHip = pose.landmarks[PoseLandmarkType.leftHip];
     final PoseLandmark? rightHip = pose.landmarks[PoseLandmarkType.rightHip];
-    if (<PoseLandmark?>[
-      leftShoulder,
-      rightShoulder,
-      leftHip,
-      rightHip,
-    ].any((PoseLandmark? point) => point == null || point.likelihood < .45)) {
+    if (<PoseLandmark?>[leftShoulder, rightShoulder, leftHip, rightHip].any(
+      (PoseLandmark? point) =>
+          point == null || point.likelihood < _minimumLandmarkConfidence,
+    )) {
       return;
     }
     final Offset ls = _translate(leftShoulder!, size);
     final Offset rs = _translate(rightShoulder!, size);
     final Offset lh = _translate(leftHip!, size);
     final Offset rh = _translate(rightHip!, size);
-    final Offset shoulderVector = rs - ls;
-    final double sleeve = shoulderVector.distance * .18;
-    final Offset normal =
-        Offset(-shoulderVector.dy, shoulderVector.dx) /
-        math.max(shoulderVector.distance, 1);
-    final Path garment = Path()
-      ..moveTo(ls.dx - shoulderVector.dx * .12, ls.dy - shoulderVector.dy * .12)
-      ..lineTo(
-        ls.dx - shoulderVector.dx * .2 - normal.dx * sleeve,
-        ls.dy - shoulderVector.dy * .2 - normal.dy * sleeve,
-      )
-      ..lineTo(lh.dx - shoulderVector.dx * .12, lh.dy - shoulderVector.dy * .12)
-      ..quadraticBezierTo(
-        (lh.dx + rh.dx) / 2,
-        (lh.dy + rh.dy) / 2 + sleeve * .25,
-        rh.dx + shoulderVector.dx * .12,
-        rh.dy + shoulderVector.dy * .12,
-      )
-      ..lineTo(
-        rs.dx + shoulderVector.dx * .2 - normal.dx * sleeve,
-        rs.dy + shoulderVector.dy * .2 - normal.dy * sleeve,
-      )
-      ..lineTo(rs.dx + shoulderVector.dx * .12, rs.dy + shoulderVector.dy * .12)
-      ..quadraticBezierTo(
-        (ls.dx + rs.dx) / 2,
-        (ls.dy + rs.dy) / 2 + sleeve * .3,
-        ls.dx - shoulderVector.dx * .12,
-        ls.dy - shoulderVector.dy * .12,
-      )
-      ..close();
-    final Rect bounds = garment.getBounds();
-    canvas.drawPath(
-      garment,
-      Paint()
-        ..shader = LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: palette,
-        ).createShader(bounds),
-    );
-    canvas.save();
-    canvas.clipPath(garment);
-    final Paint shard = Paint()
-      ..color = Colors.white.withValues(alpha: echoMode ? .32 : .18)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.2;
-    final double step = math.max(22, bounds.width / 7);
-    for (double x = bounds.left - bounds.height; x < bounds.right; x += step) {
-      canvas.drawLine(
-        Offset(x, bounds.bottom),
-        Offset(x + bounds.height, bounds.top),
-        shard,
+    final bool semanticLeftIsScreenLeft = ls.dx <= rs.dx;
+    final Offset screenLeftShoulder = semanticLeftIsScreenLeft ? ls : rs;
+    final Offset screenRightShoulder = semanticLeftIsScreenLeft ? rs : ls;
+    final Offset screenLeftHip = lh.dx <= rh.dx ? lh : rh;
+    final Offset screenRightHip = lh.dx <= rh.dx ? rh : lh;
+    final PoseLandmark? leftElbowLandmark = semanticLeftIsScreenLeft
+        ? pose.landmarks[PoseLandmarkType.leftElbow]
+        : pose.landmarks[PoseLandmarkType.rightElbow];
+    final PoseLandmark? rightElbowLandmark = semanticLeftIsScreenLeft
+        ? pose.landmarks[PoseLandmarkType.rightElbow]
+        : pose.landmarks[PoseLandmarkType.leftElbow];
+    final Offset shoulderCenter =
+        (screenLeftShoulder + screenRightShoulder) / 2;
+    final Offset hipCenter = (screenLeftHip + screenRightHip) / 2;
+    final Offset acrossVector = screenRightShoulder - screenLeftShoulder;
+    final double shoulderWidth = acrossVector.distance;
+    if (shoulderWidth < _minimumShoulderWidth) return;
+    final Offset across = acrossVector / shoulderWidth;
+    final Offset torsoVector = hipCenter - shoulderCenter;
+    final Offset down = torsoVector.distance < 1
+        ? Offset(-across.dy, across.dx)
+        : torsoVector / torsoVector.distance;
+    final double sleeveFactor = kind == WearableKind.hoodie ? .7 : .45;
+    final Offset fallbackLeftElbow =
+        screenLeftShoulder -
+        across * shoulderWidth * .38 +
+        down * shoulderWidth * .35;
+    final Offset fallbackRightElbow =
+        screenRightShoulder +
+        across * shoulderWidth * .38 +
+        down * shoulderWidth * .35;
+    final Offset detectedLeftElbow = leftElbowLandmark == null
+        ? fallbackLeftElbow
+        : _translate(leftElbowLandmark, size);
+    final Offset detectedRightElbow = rightElbowLandmark == null
+        ? fallbackRightElbow
+        : _translate(rightElbowLandmark, size);
+    final Offset outerLeftShoulder =
+        screenLeftShoulder - across * shoulderWidth * .1;
+    final Offset outerRightShoulder =
+        screenRightShoulder + across * shoulderWidth * .1;
+    final Offset leftSleeve = Offset.lerp(
+      outerLeftShoulder,
+      detectedLeftElbow,
+      sleeveFactor,
+    )!;
+    final Offset rightSleeve = Offset.lerp(
+      outerRightShoulder,
+      detectedRightElbow,
+      sleeveFactor,
+    )!;
+    final double sleeveDepth =
+        shoulderWidth * (kind == WearableKind.hoodie ? .2 : .14);
+    final Offset neckLeft = shoulderCenter - across * shoulderWidth * .15;
+    final Offset neckRight = shoulderCenter + across * shoulderWidth * .15;
+    final Offset leftHem = screenLeftHip - across * shoulderWidth * .08;
+    final Offset rightHem = screenRightHip + across * shoulderWidth * .08;
+    final Path garment = Path()..moveTo(neckLeft.dx, neckLeft.dy);
+    if (kind == WearableKind.hoodie) {
+      garment.quadraticBezierTo(
+        shoulderCenter.dx - down.dx * shoulderWidth * .34,
+        shoulderCenter.dy - down.dy * shoulderWidth * .34,
+        neckRight.dx,
+        neckRight.dy,
+      );
+    } else {
+      garment.quadraticBezierTo(
+        shoulderCenter.dx + down.dx * shoulderWidth * .1,
+        shoulderCenter.dy + down.dy * shoulderWidth * .1,
+        neckRight.dx,
+        neckRight.dy,
       );
     }
-    canvas.restore();
+    garment
+      ..lineTo(outerRightShoulder.dx, outerRightShoulder.dy)
+      ..lineTo(rightSleeve.dx, rightSleeve.dy)
+      ..lineTo(
+        rightSleeve.dx + down.dx * sleeveDepth,
+        rightSleeve.dy + down.dy * sleeveDepth,
+      )
+      ..quadraticBezierTo(
+        screenRightShoulder.dx + down.dx * shoulderWidth * .42,
+        screenRightShoulder.dy + down.dy * shoulderWidth * .42,
+        rightHem.dx,
+        rightHem.dy,
+      );
+    if (kind == WearableKind.dress) {
+      final PoseLandmark? leftKnee = pose.landmarks[PoseLandmarkType.leftKnee];
+      final PoseLandmark? rightKnee =
+          pose.landmarks[PoseLandmarkType.rightKnee];
+      final Offset kneeCenter = leftKnee != null && rightKnee != null
+          ? (_translate(leftKnee, size) + _translate(rightKnee, size)) / 2
+          : hipCenter + down * torsoVector.distance * .9;
+      final Offset dressCenter = Offset.lerp(hipCenter, kneeCenter, .72)!;
+      garment
+        ..lineTo(
+          dressCenter.dx + across.dx * shoulderWidth * .62,
+          dressCenter.dy + across.dy * shoulderWidth * .62,
+        )
+        ..quadraticBezierTo(
+          dressCenter.dx,
+          dressCenter.dy + shoulderWidth * .08,
+          dressCenter.dx - across.dx * shoulderWidth * .62,
+          dressCenter.dy - across.dy * shoulderWidth * .62,
+        )
+        ..lineTo(leftHem.dx, leftHem.dy);
+    } else {
+      garment.quadraticBezierTo(
+        hipCenter.dx,
+        hipCenter.dy + shoulderWidth * .04,
+        leftHem.dx,
+        leftHem.dy,
+      );
+    }
+    garment
+      ..quadraticBezierTo(
+        screenLeftShoulder.dx + down.dx * shoulderWidth * .42,
+        screenLeftShoulder.dy + down.dy * shoulderWidth * .42,
+        leftSleeve.dx + down.dx * sleeveDepth,
+        leftSleeve.dy + down.dy * sleeveDepth,
+      )
+      ..lineTo(leftSleeve.dx, leftSleeve.dy)
+      ..lineTo(outerLeftShoulder.dx, outerLeftShoulder.dy)
+      ..close();
+    _paintCrystalGarment(canvas, garment);
+    _paintGarmentSeams(
+      canvas: canvas,
+      neckLeft: neckLeft,
+      neckRight: neckRight,
+      shoulderCenter: shoulderCenter,
+      outerLeftShoulder: outerLeftShoulder,
+      outerRightShoulder: outerRightShoulder,
+      down: down,
+      shoulderWidth: shoulderWidth,
+    );
+  }
+
+  /*
+   * Общий рендерер гарантирует, что в AR и в карточке вещи
+   * используются одинаковые палитра, seed и алгоритм принта.
+   */
+  void _paintCrystalGarment(Canvas canvas, Path garment) {
+    final Rect bounds = garment.getBounds();
+    CrystalPatternRenderer(palette: palette, seed: seed).paint(
+      canvas: canvas,
+      clipPath: garment,
+      bounds: bounds,
+      opacity: echoMode ? .86 : .72,
+    );
     canvas.drawPath(
       garment,
       Paint()
@@ -427,98 +538,116 @@ class _PoseGarmentPainter extends CustomPainter {
     );
   }
 
-  Offset _translate(PoseLandmark point, Size canvasSize) {
-    double sourceWidth = imageSize.width;
-    double sourceHeight = imageSize.height;
-    double x = point.x;
-    double y = point.y;
-    if (rotation == InputImageRotation.rotation90deg) {
-      final double oldX = x;
-      x = imageSize.height - y;
-      y = oldX;
-      sourceWidth = imageSize.height;
-      sourceHeight = imageSize.width;
-    } else if (rotation == InputImageRotation.rotation270deg) {
-      final double oldX = x;
-      x = y;
-      y = imageSize.width - oldX;
-      sourceWidth = imageSize.height;
-      sourceHeight = imageSize.width;
-    } else if (rotation == InputImageRotation.rotation180deg) {
-      x = imageSize.width - x;
-      y = imageSize.height - y;
-    }
-    final double scale = math.max(
-      canvasSize.width / sourceWidth,
-      canvasSize.height / sourceHeight,
+  /*
+   * Горловина и плечевые швы отделяют одежду от обычной
+   * цветной маски, не перекрывая при этом кристаллический принт.
+   */
+  void _paintGarmentSeams({
+    required Canvas canvas,
+    required Offset neckLeft,
+    required Offset neckRight,
+    required Offset shoulderCenter,
+    required Offset outerLeftShoulder,
+    required Offset outerRightShoulder,
+    required Offset down,
+    required double shoulderWidth,
+  }) {
+    final Paint seamPaint = Paint()
+      ..color = Colors.white.withValues(alpha: .5)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5;
+    final Path neckline = Path()..moveTo(neckLeft.dx, neckLeft.dy);
+    final double curveDirection = kind == WearableKind.hoodie ? -.34 : .1;
+    neckline.quadraticBezierTo(
+      shoulderCenter.dx + down.dx * shoulderWidth * curveDirection,
+      shoulderCenter.dy + down.dy * shoulderWidth * curveDirection,
+      neckRight.dx,
+      neckRight.dy,
     );
-    final double offsetX = (canvasSize.width - sourceWidth * scale) / 2;
-    final double offsetY = (canvasSize.height - sourceHeight * scale) / 2;
-    return Offset(
-      canvasSize.width - (x * scale + offsetX),
-      y * scale + offsetY,
+    canvas.drawPath(neckline, seamPaint);
+    canvas.drawLine(
+      outerLeftShoulder,
+      outerLeftShoulder + down * shoulderWidth * .16,
+      seamPaint,
+    );
+    canvas.drawLine(
+      outerRightShoulder,
+      outerRightShoulder + down * shoulderWidth * .16,
+      seamPaint,
+    );
+  }
+
+  /* Для кед используются точки пятки, носка и лодыжки вместо торса. */
+  void _paintSneakers(Canvas canvas, Size size) {
+    final List<(PoseLandmarkType, PoseLandmarkType, PoseLandmarkType)> feet =
+        <(PoseLandmarkType, PoseLandmarkType, PoseLandmarkType)>[
+          (
+            PoseLandmarkType.leftAnkle,
+            PoseLandmarkType.leftHeel,
+            PoseLandmarkType.leftFootIndex,
+          ),
+          (
+            PoseLandmarkType.rightAnkle,
+            PoseLandmarkType.rightHeel,
+            PoseLandmarkType.rightFootIndex,
+          ),
+        ];
+    for (final (
+          PoseLandmarkType ankleType,
+          PoseLandmarkType heelType,
+          PoseLandmarkType toeType,
+        )
+        in feet) {
+      final PoseLandmark? ankle = pose.landmarks[ankleType];
+      final PoseLandmark? heel = pose.landmarks[heelType];
+      final PoseLandmark? toe = pose.landmarks[toeType];
+      if (ankle == null || heel == null || toe == null) continue;
+      final Offset a = _translate(ankle, size);
+      final Offset h = _translate(heel, size);
+      final Offset t = _translate(toe, size);
+      final Offset direction = t - h;
+      final double width = math.max(18, direction.distance * .32);
+      final Offset normal =
+          Offset(-direction.dy, direction.dx) / math.max(direction.distance, 1);
+      final Path shoe = Path()
+        ..moveTo(a.dx + normal.dx * width, a.dy + normal.dy * width)
+        ..lineTo(t.dx + normal.dx * width, t.dy + normal.dy * width)
+        ..quadraticBezierTo(
+          t.dx,
+          t.dy,
+          t.dx - normal.dx * width,
+          t.dy - normal.dy * width,
+        )
+        ..lineTo(h.dx - normal.dx * width, h.dy - normal.dy * width)
+        ..quadraticBezierTo(
+          a.dx,
+          a.dy,
+          a.dx + normal.dx * width,
+          a.dy + normal.dy * width,
+        )
+        ..close();
+      _paintCrystalGarment(canvas, shoe);
+    }
+  }
+
+  /*
+   * Переводит координаты ML Kit в систему полноэкранного CameraPreview.
+   * Масштаб BoxFit.cover учитывает обрезку кадра, а фронтальная камера — зеркало.
+   */
+  Offset _translate(PoseLandmark point, Size canvasSize) {
+    return PoseCoordinateMapper.toPreview(
+      landmark: point,
+      imageSize: imageSize,
+      canvasSize: canvasSize,
+      rotation: rotation,
+      lensDirection: lensDirection,
     );
   }
 
   @override
   bool shouldRepaint(covariant _PoseGarmentPainter oldDelegate) =>
-      oldDelegate.pose != pose || oldDelegate.echoMode != echoMode;
-}
-
-class _RoundAction extends StatelessWidget {
-  const _RoundAction({required this.icon, required this.onTap});
-  final IconData icon;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) => IconButton.filled(
-    onPressed: onTap,
-    style: IconButton.styleFrom(
-      backgroundColor: AppColors.background.withValues(alpha: .68),
-      side: const BorderSide(color: Colors.white24),
-    ),
-    icon: Icon(icon),
-  );
-}
-
-class _TryOnAction extends StatelessWidget {
-  const _TryOnAction({
-    required this.icon,
-    required this.label,
-    required this.onTap,
-    this.active = false,
-  });
-  final IconData icon;
-  final String label;
-  final VoidCallback onTap;
-  final bool active;
-
-  @override
-  Widget build(BuildContext context) => GestureDetector(
-    onTap: onTap,
-    child: Column(
-      children: <Widget>[
-        Container(
-          width: 48,
-          height: 48,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: active
-                ? AppColors.acid
-                : AppColors.background.withValues(alpha: .65),
-            border: Border.all(color: active ? AppColors.acid : Colors.white24),
-          ),
-          child: Icon(
-            icon,
-            color: active ? AppColors.background : Colors.white,
-          ),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          label,
-          style: Theme.of(context).textTheme.labelLarge?.copyWith(fontSize: 9),
-        ),
-      ],
-    ),
-  );
+      oldDelegate.pose != pose ||
+      oldDelegate.echoMode != echoMode ||
+      oldDelegate.kind != kind ||
+      oldDelegate.lensDirection != lensDirection;
 }

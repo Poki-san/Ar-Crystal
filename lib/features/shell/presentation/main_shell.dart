@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
 
 import '../../../core/theme/app_theme.dart';
-import '../../create/presentation/create_screen.dart';
 import '../../gallery/presentation/gallery_screen.dart';
 import '../../market/presentation/market_screen.dart';
 import '../../profile/presentation/profile_screen.dart';
+import '../../scanner/presentation/create_screen.dart';
 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
@@ -27,7 +27,11 @@ class _MainShellState extends State<MainShell> {
   Widget build(BuildContext context) {
     return Scaffold(
       extendBody: true,
-      body: IndexedStack(index: _index, children: _pages),
+      /*
+       * В дереве остаётся только активная вкладка: два одновременных Camera2
+       * контроллера нестабильны на складных устройствах и части бюджетных моделей.
+       */
+      body: KeyedSubtree(key: ValueKey<int>(_index), child: _pages[_index]),
       bottomNavigationBar: Container(
         decoration: const BoxDecoration(
           border: Border(top: BorderSide(color: AppColors.line, width: .7)),

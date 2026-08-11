@@ -2,6 +2,19 @@ import 'package:flutter/material.dart';
 
 enum WearableKind { tshirt, hoodie, dress, sneakers }
 
+extension WearableKindPresentation on WearableKind {
+  String get label => switch (this) {
+    WearableKind.tshirt => 'ФУТБОЛКА',
+    WearableKind.hoodie => 'ХУДИ',
+    WearableKind.dress => 'ПЛАТЬЕ',
+    WearableKind.sneakers => 'КЕДЫ',
+  };
+}
+
+/*
+ * Локальная модель цифровой одежды. Она не зависит от UI и содержит только
+ * сериализуемые метаданные и пути к файлам внутри каталога приложения.
+ */
 class Wearable {
   const Wearable({
     required this.id,
@@ -31,6 +44,7 @@ class Wearable {
   final String? audioPath;
   final DateTime? createdAt;
 
+  /* Подготавливает модель для хранения в SharedPreferences как JSON. */
   Map<String, Object?> toJson() => <String, Object?>{
     'id': id,
     'name': name,
@@ -46,6 +60,7 @@ class Wearable {
     'createdAt': createdAt?.toIso8601String(),
   };
 
+  /* Восстанавливает локально сохранённый предмет без сетевых запросов. */
   factory Wearable.fromJson(Map<String, Object?> json) {
     final List<Object?> colors = json['palette']! as List<Object?>;
     return Wearable(

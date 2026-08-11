@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/models/wearable.dart';
 import '../../../core/theme/app_theme.dart';
-import '../../../core/widgets/crystal_art.dart';
+import '../../crystallizer/domain/entities/wearable.dart';
+import '../../crystallizer/presentation/widgets/crystal_art.dart';
 import '../../item/presentation/item_detail_screen.dart';
 
 class MarketScreen extends StatefulWidget {
