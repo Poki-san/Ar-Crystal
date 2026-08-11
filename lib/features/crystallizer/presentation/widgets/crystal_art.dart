@@ -19,17 +19,24 @@ class CrystalArt extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return CustomPaint(
-      painter: CrystalPainter(wearable: wearable, showGrid: showGrid),
+      painter: CrystalPainter(wearable: wearable, fit: fit, showGrid: showGrid),
       size: Size.infinite,
     );
   }
 }
 
 class CrystalPainter extends CustomPainter {
-  CrystalPainter({required this.wearable, required this.showGrid});
+  CrystalPainter({
+    required this.wearable,
+    required this.fit,
+    required this.showGrid,
+  });
 
   final Wearable wearable;
+  final BoxFit fit;
   final bool showGrid;
+
+  static const Size _designSize = Size(720, 1000);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -46,11 +53,28 @@ class CrystalPainter extends CustomPainter {
     );
     if (showGrid) _paintGrid(canvas, size);
 
-    final Path garment = _garmentPath(size, wearable.kind);
+    /*
+     * Силуэт всегда строится на холсте с одной пропорцией. Контейнер может
+     * меняться от маленькой карточки до SliverAppBar, но одежда не растягивается.
+     */
+    final FittedSizes fitted = applyBoxFit(fit, _designSize, size);
+    final Rect contentRect = Alignment.center.inscribe(
+      fitted.destination,
+      bounds,
+    );
+    canvas.save();
+    canvas.clipRect(bounds);
+    canvas.translate(contentRect.left, contentRect.top);
+
+    final Path garment = _garmentPath(contentRect.size, wearable.kind);
     CrystalPatternRenderer(
       palette: wearable.palette,
       seed: wearable.seed,
-    ).paint(canvas: canvas, clipPath: garment, bounds: bounds);
+    ).paint(
+      canvas: canvas,
+      clipPath: garment,
+      bounds: Offset.zero & contentRect.size,
+    );
     canvas.drawPath(
       garment,
       Paint()
@@ -58,6 +82,7 @@ class CrystalPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2.2,
     );
+    canvas.restore();
   }
 
   void _paintGrid(Canvas canvas, Size size) {
@@ -137,7 +162,9 @@ class CrystalPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CrystalPainter oldDelegate) =>
-      oldDelegate.wearable != wearable || oldDelegate.showGrid != showGrid;
+      oldDelegate.wearable != wearable ||
+      oldDelegate.fit != fit ||
+      oldDelegate.showGrid != showGrid;
 }
 
 class EchoButton extends StatelessWidget {
